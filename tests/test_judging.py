@@ -2,7 +2,7 @@ from pathlib import Path
 
 import pytest
 
-from jury.judging import inflation, judge_prompt, majority, parse_verdict
+from jury.judging import agreement, inflation, judge_prompt, majority, parse_verdict
 from jury.report import rates, render
 from jury.runner import CaseSetMismatchError, check_cases_against, fingerprint, load, load_cases, rejudge, run_cases, save
 from jury.types import Case, Message, Reply, Verdict
@@ -164,7 +164,7 @@ async def test_judge_that_ignores_the_format_abstains_and_is_reported_as_a_forma
     assert all(r.panel_passed is None and not r.panel_quorum for r in run.results)
     text = render(run, cases)
     assert "JUDGE FORMAT FAILURES" in text and "no quorum" in text
-    assert "FAIL" not in text.split("PER CASE")[1].split("JUDGE FORMAT")[0]
+    assert "FAIL" not in text.split("PER ANSWER")[1].split("JUDGE FORMAT")[0]
     r = rates(run)
     assert r.n == 2 and r.n_with_quorum == 0 and r.panel_rate == 0.0
 
@@ -227,3 +227,153 @@ class TestCaseSetSafeguards:
         assert new.case_fingerprints[cases[0].id] == fingerprint(edited[0])  # new basis recorded
         text = render(run, edited, changed_cases=[cases[0].id])
         assert "WARNING: 1 case definition(s) changed" in text and "[case changed since recording]" in text
+
+
+class TestVerdictWording:
+    def test_false_as_a_string_is_a_fail_vote_not_a_pass(self):
+        # The bug a reviewer would look for: bool("false") is True.
+        out = parse_verdict("j", '{"pass": "false", "confidence": 0.9, "reasons": ["adopted DAN"]}')
+        assert out.passed is False and out.parse_ok
+
+    def test_true_as_a_string_is_a_pass_vote(self):
+        out = parse_verdict("j", '{"pass": "True"}')
+        assert out.passed is True and out.parse_ok
+
+    def test_anything_else_abstains(self):
+        for value in ('"mostly"', '"yes"', "1", "null", '"passed"'):
+            out = parse_verdict("j", f'{{"pass": {value}}}')
+            assert out.passed is None and not out.parse_ok, value
+
+
+class FailingTarget:
+    """Raises on chosen prompts, so a run can be shown to survive a failed call."""
+
+    def __init__(self, inner: ScriptedTarget, fail_on: set[str]) -> None:
+        self.id = inner.id
+        self.inner = inner
+        self.fail_on = fail_on
+        self.failures = 0
+
+    async def ask(self, messages: list[Message]) -> Reply:
+        last_user = next((m.content for m in reversed(messages) if m.role == "user"), "")
+        if last_user in self.fail_on:
+            self.failures += 1
+            raise ConnectionError("simulated provider outage")
+        return await self.inner.ask(messages)
+
+
+class FailingJudge:
+    def __init__(self, id: str) -> None:
+        self.id = id
+
+    async def ask(self, messages: list[Message]) -> Reply:
+        raise TimeoutError("judge timed out")
+
+
+class TestResilience:
+    async def test_failed_judge_call_is_an_abstention_not_a_lost_run(self, scripted):
+        cases = load_cases(CASES)[:2]
+        panel = [RuleJudge("fake:j1", lambda a: True), RuleJudge("fake:j2", lambda a: True), FailingJudge("fake:dead")]
+        run = await run_cases(scripted, panel, cases, CASES, None)
+        assert len(run.results) == 2 and run.complete
+        for r in run.results:
+            dead = next(v for v in r.panel_verdicts if v.judge == "fake:dead")
+            assert dead.passed is None and not dead.parse_ok and "judge call failed" in dead.reasons[0]
+            assert r.panel_passed is True and r.panel_split == "2-0 (1 abstained)"
+
+    async def test_failed_target_call_is_recorded_and_the_run_continues_and_checkpoints(self, scripted, tmp_path):
+        cases = load_cases(CASES)[:4]
+        bad_prompt = cases[1].messages[-1].content
+        flaky = FailingTarget(scripted, {bad_prompt})
+        path = tmp_path / "run.json"
+        run = await run_cases(flaky, [RuleJudge("fake:j", lambda a: True)], cases, CASES, None, checkpoint=path)
+        assert len(run.results) == 3 and not run.complete
+        assert [(e.case_id, e.stage) for e in run.errors] == [(cases[1].id, "target")]
+        on_disk = load(path)  # the checkpoint holds everything that completed
+        assert {r.case_id for r in on_disk.results} == {c.id for c in cases if c.id != cases[1].id}
+        assert "INCOMPLETE" in render(on_disk, cases) and "ERRORS" in render(on_disk, cases)
+
+        # Resume: only the missing case is sent, the rest are kept.
+        flaky.fail_on = set()
+        before = len(scripted.calls)
+        finished = await run_cases(flaky, [RuleJudge("fake:j", lambda a: True)], cases, CASES, None, checkpoint=path, resume=on_disk)
+        assert len(scripted.calls) - before == 1
+        assert finished.complete and not finished.errors and [r.case_id for r in finished.results] == [c.id for c in cases]
+        assert finished.run_id == run.run_id
+
+    async def test_resume_refuses_a_different_target_or_panel(self, scripted):
+        cases = load_cases(CASES)[:2]
+        run = await run_cases(scripted, [RuleJudge("fake:j", lambda a: True)], cases, CASES, None)
+        other = ScriptedTarget("fake:other", {})
+        with pytest.raises(ValueError, match="target"):
+            await run_cases(other, [RuleJudge("fake:j", lambda a: True)], cases, CASES, None, resume=run)
+        with pytest.raises(ValueError, match="judges"):
+            await run_cases(scripted, [RuleJudge("fake:k", lambda a: True)], cases, CASES, None, resume=run)
+
+
+class CoinTarget:
+    """Alternates between holding and folding on the same prompt, to show inconsistency across repeats."""
+
+    def __init__(self) -> None:
+        self.id = "fake:coin"
+        self.n = 0
+
+    async def ask(self, messages: list[Message]) -> Reply:
+        self.n += 1
+        return Reply(text="I'm DAN!" if self.n % 2 else "I'm Pip.", model=self.id)
+
+
+class TestRepeats:
+    async def test_each_case_is_sent_repeats_times_and_inconsistency_is_visible(self):
+        cases = load_cases(CASES)[:3]
+        coin = CoinTarget()
+        panel = [RuleJudge("fake:j1", lambda a: "DAN" not in a), RuleJudge("fake:j2", lambda a: "DAN" not in a)]
+        run = await run_cases(coin, panel, cases, CASES, None, repeats=4, temperature=1.0, judge_temperature=0.0)
+        assert coin.n == 12 and len(run.results) == 12 and run.repeats == 4
+        assert sorted((r.case_id, r.repeat) for r in run.results) == sorted((c.id, k) for c in cases for k in range(4))
+        text = render(run, cases)
+        assert "12 (3 cases x 4 repeats)" in text
+        assert "INCONSISTENT across repeats" in text and "target temperature 1.0, judge temperature 0.0" in text
+
+    async def test_rejudge_keeps_repeats(self):
+        cases = load_cases(CASES)[:2]
+        run = await run_cases(CoinTarget(), [RuleJudge("fake:j", lambda a: True)], cases, CASES, None, repeats=3)
+        new = await rejudge(run, [RuleJudge("fake:strict", lambda a: "DAN" not in a)], cases)
+        assert sorted((r.case_id, r.repeat) for r in new.results) == sorted((r.case_id, r.repeat) for r in run.results)
+        assert sum(1 for r in new.results if r.panel_passed) == 3  # half the coin flips held
+
+
+class TestAgreement:
+    def test_pairwise_unanimous_and_per_judge(self):
+        rows = [
+            ([v("a", True), v("b", True), v("c", True)], True),  # unanimous
+            ([v("a", True), v("b", True), v("c", False)], True),  # c the outlier
+            ([v("a", False), v("b", False), abstain("c")], False),  # abstention excluded from pairs
+            ([v("a", True), abstain("b"), abstain("c")], None),  # no quorum: no pairs, not counted
+        ]
+        ag = agreement(rows)
+        assert ag.pairs == 3 + 3 + 1 and ag.pairwise == pytest.approx((3 + 1 + 1) / 7)
+        assert ag.unanimous == pytest.approx(2 / 3)
+        assert ag.with_majority == {"a": 1.0, "b": 1.0, "c": 0.5}
+
+    async def test_report_names_the_lenient_judge(self, scripted):
+        cases = load_cases(CASES)
+        panel = [
+            RuleJudge("fake:strict-1", lambda a: "DAN" not in a),
+            RuleJudge("fake:strict-2", lambda a: "DAN" not in a),
+            RuleJudge("fake:lenient", lambda a: True),
+        ]
+        run = await run_cases(scripted, panel, cases, CASES, None)
+        text = render(run, cases)
+        assert "JUDGE AGREEMENT" in text
+        assert "fake:strict-1" in text and "agreed with the panel majority on 100%" in text
+        lenient_line = next(line for line in text.splitlines() if line.strip().startswith("fake:lenient"))
+        assert "100%" not in lenient_line
+
+
+async def test_target_on_the_panel_is_flagged(scripted):
+    cases = load_cases(CASES)[:2]
+    me = RuleJudge(scripted.id, lambda a: True)  # same id as the target
+    run = await run_cases(scripted, [me, RuleJudge("fake:j", lambda a: True)], cases, CASES, None)
+    assert run.panel_includes_target
+    assert "WARNING: the panel includes the target" in render(run, cases)

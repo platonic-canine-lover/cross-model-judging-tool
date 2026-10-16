@@ -9,12 +9,13 @@ from jury.types import Message, Reply, Target, Usage
 
 
 class AnthropicTarget:
-    def __init__(self, model: str, max_tokens: int = 1024) -> None:
+    def __init__(self, model: str, max_tokens: int = 1024, temperature: float | None = None) -> None:
         import anthropic  # local import so the package is optional
 
         self.id = f"anthropic:{model}"
         self.model = model
         self.max_tokens = max_tokens
+        self.temperature = temperature
         self._client = anthropic.AsyncAnthropic(api_key=env("ANTHROPIC_API_KEY", provider="anthropic"))
 
     async def ask(self, messages: list[Message]) -> Reply:
@@ -23,6 +24,8 @@ class AnthropicTarget:
         kwargs: dict[str, object] = {"model": self.model, "max_tokens": self.max_tokens, "messages": turns}
         if system:
             kwargs["system"] = system
+        if self.temperature is not None:
+            kwargs["temperature"] = self.temperature
         resp = await self._client.messages.create(**cast(Any, kwargs))
         text = "".join(getattr(block, "text", "") for block in resp.content)
         u = resp.usage
@@ -39,5 +42,5 @@ class AnthropicTarget:
 
 
 @register("anthropic")
-def _factory(model: str) -> Target:
-    return AnthropicTarget(model)
+def _factory(model: str, temperature: float | None) -> Target:
+    return AnthropicTarget(model, temperature=temperature)

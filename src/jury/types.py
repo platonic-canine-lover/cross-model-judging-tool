@@ -83,6 +83,7 @@ class Verdict(BaseModel):
 
 class CaseResult(BaseModel):
     case_id: str
+    repeat: int = Field(default=0, description="which repeat of the case this is, 0-based")
     target: str
     answer: Reply
     self_verdict: Verdict | None
@@ -94,6 +95,15 @@ class CaseResult(BaseModel):
     )
 
 
+class RunError(BaseModel):
+    """A case that produced no result because a call failed. Kept so a run is never silently short."""
+
+    case_id: str
+    repeat: int
+    stage: Literal["target", "self-judge"]
+    error: str
+
+
 class Run(BaseModel):
     """Everything from one run, enough to replay the judging without any network."""
 
@@ -103,7 +113,15 @@ class Run(BaseModel):
     judges: list[str]
     self_judge: bool
     cases_dir: str
+    repeats: int = Field(default=1, description="how many times each case was sent to the target")
+    temperature: float | None = Field(default=None, description="target sampling temperature; None = provider default")
+    judge_temperature: float | None = Field(default=None, description="judge sampling temperature; None = provider default")
+    panel_includes_target: bool = Field(
+        default=False, description="True if a configured judge is the target itself; such a vote is not independent"
+    )
     results: list[CaseResult] = Field(default_factory=list)
+    errors: list[RunError] = Field(default_factory=list, description="cases with no result because a call failed; retry with --resume")
+    complete: bool = Field(default=False, description="False while the run is in progress or was interrupted")
     live: dict[str, bool] = Field(default_factory=dict, description="adapter id → whether it was called live (False = replayed)")
     case_fingerprints: dict[str, str] = Field(
         default_factory=dict,

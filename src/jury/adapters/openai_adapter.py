@@ -2,25 +2,26 @@
 
 from __future__ import annotations
 
-from typing import Any, cast
+from typing import Any
 
 from jury.adapters.base import env, register
 from jury.types import Message, Reply, Target, Usage
 
 
 class OpenAITarget:
-    def __init__(self, model: str, client: Any | None = None, provider: str = "openai") -> None:
+    def __init__(self, model: str, client: Any | None = None, provider: str = "openai", temperature: float | None = None) -> None:
         import openai
 
         self.id = f"{provider}:{model}"
         self.model = model
+        self.temperature = temperature
         self._client = client or openai.AsyncOpenAI(api_key=env("OPENAI_API_KEY", provider="openai"))
 
     async def ask(self, messages: list[Message]) -> Reply:
-        resp = await self._client.chat.completions.create(
-            model=self.model,
-            messages=cast(Any, [{"role": m.role, "content": m.content} for m in messages]),
-        )
+        kwargs: dict[str, Any] = {"model": self.model, "messages": [{"role": m.role, "content": m.content} for m in messages]}
+        if self.temperature is not None:
+            kwargs["temperature"] = self.temperature
+        resp = await self._client.chat.completions.create(**kwargs)
         choice = resp.choices[0]
         u = resp.usage
         cached = None
@@ -37,12 +38,12 @@ class OpenAITarget:
 
 
 @register("openai")
-def _factory(model: str) -> Target:
-    return OpenAITarget(model)
+def _factory(model: str, temperature: float | None) -> Target:
+    return OpenAITarget(model, temperature=temperature)
 
 
 @register("azure")
-def _azure_factory(deployment: str) -> Target:
+def _azure_factory(deployment: str, temperature: float | None) -> Target:
     """Azure OpenAI: the models behind Copilot. AZURE_OPENAI_ENDPOINT, AZURE_OPENAI_API_KEY, AZURE_OPENAI_API_VERSION."""
     import openai
 
@@ -51,4 +52,4 @@ def _azure_factory(deployment: str) -> Target:
         api_key=env("AZURE_OPENAI_API_KEY", provider="azure"),
         api_version=env("AZURE_OPENAI_API_VERSION", provider="azure"),
     )
-    return OpenAITarget(deployment, client=client, provider="azure")
+    return OpenAITarget(deployment, client=client, provider="azure", temperature=temperature)

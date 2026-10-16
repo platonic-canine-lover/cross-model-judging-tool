@@ -16,8 +16,8 @@ from __future__ import annotations
 from collections import defaultdict
 from dataclasses import dataclass
 
-from jury.judging import inflation
-from jury.types import Case, Run
+from jury.judging import agreement, inflation
+from jury.types import Case, CaseResult, Run
 
 
 @dataclass
@@ -90,6 +90,16 @@ def render(run: Run, cases: list[Case], changed_cases: list[str] | None = None) 
     reported = sorted({_judge_label(v.judge, v.reported_model) for r in run.results for v in r.panel_verdicts if v.reported_model})
     if any("(reported" in x for x in reported):
         lines.append("judge identities as reported by providers: " + ", ".join(x for x in reported if "(reported" in x))
+    temps = f"target temperature {run.temperature if run.temperature is not None else 'provider default'}, judge temperature {run.judge_temperature if run.judge_temperature is not None else 'provider default'}"
+    lines.append(f"repeats per case: {run.repeats}    {temps}")
+    if run.panel_includes_target:
+        lines.append(
+            f"WARNING: the panel includes the target ({run.target}). That vote is not an independent opinion; the panel rate below is partly the target grading itself."
+        )
+    if not run.complete:
+        lines.append(
+            f"WARNING: this run is INCOMPLETE: {len(run.errors)} (case, repeat) pair(s) produced no result. Rates below are over what completed. Finish it with: jury run --resume <recording>."
+        )
     if changed:
         lines.append(
             f"WARNING: {len(changed)} case definition(s) changed since this recording was made: {', '.join(sorted(changed))}. Verdicts on them are not comparable with the original run."
@@ -98,8 +108,13 @@ def render(run: Run, cases: list[Case], changed_cases: list[str] | None = None) 
 
     overall = rates(run)
     no_quorum = overall.n - overall.n_with_quorum
+    n_cases = len({r.case_id for r in run.results})
     lines.append("OVERALL")
-    lines.append(f"  cases {overall.n}" + (f" ({no_quorum} without a panel quorum, excluded from the panel rate)" if no_quorum else ""))
+    lines.append(
+        f"  answers {overall.n}"
+        + (f" ({n_cases} cases x {run.repeats} repeats)" if run.repeats > 1 else "")
+        + (f" ({no_quorum} without a panel quorum, excluded from the panel rate)" if no_quorum else "")
+    )
     if run.self_judge:
         lines.append(f"  self-judged pass rate                     {pct(overall.self_rate)}  ({overall.self_pass}/{overall.n})")
     lines.append(
@@ -114,6 +129,15 @@ def render(run: Run, cases: list[Case], changed_cases: list[str] | None = None) 
         )
     lines.append("")
 
+    ag = agreement([(r.panel_verdicts, r.panel_passed if r.panel_quorum else None) for r in run.results])
+    lines.append("JUDGE AGREEMENT  (how far the panel agrees with itself; observed, not chance-corrected)")
+    lines.append(f"  pairwise agreement     {pct(ag.pairwise)}  over {ag.pairs} judge pairs")
+    lines.append(f"  unanimous answers      {pct(ag.unanimous)}  of answers with a quorum")
+    for j in run.judges:
+        if j in ag.with_majority:
+            lines.append(f"  {j:40} agreed with the panel majority on {pct(ag.with_majority[j])} of its usable verdicts")
+    lines.append("")
+
     cats: dict[str, list[str]] = defaultdict(list)
     for r in run.results:
         cats[by_id[r.case_id].category].append(r.case_id)
@@ -126,7 +150,28 @@ def render(run: Run, cases: list[Case], changed_cases: list[str] | None = None) 
             lines.append(f"  {cat:32} {pct(rt.panel_rate):>5}")
     lines.append("")
 
-    lines.append("PER CASE  (S = self verdict, P = panel verdict with split; 'no quorum' = too few usable judge verdicts)")
+    if run.repeats > 1:
+        lines.append(
+            "PER CASE ACROSS REPEATS  (S = self passes / repeats, P = panel passes / repeats with quorum; a split case is one the target does not do consistently)"
+        )
+        by_case: dict[str, list[CaseResult]] = defaultdict(list)
+        for r in run.results:
+            by_case[r.case_id].append(r)
+        for cid, rs in by_case.items():
+            c = by_id[cid]
+            s_n = sum(1 for r in rs if r.self_verdict is not None and r.self_verdict.passed is not None)
+            s_p = sum(1 for r in rs if r.self_verdict is not None and r.self_verdict.passed)
+            q = [r for r in rs if r.panel_quorum]
+            p_p = sum(1 for r in q if r.panel_passed)
+            consistent = len(q) and (p_p == 0 or p_p == len(q))
+            flag = "" if consistent or not q else "  <- INCONSISTENT across repeats"
+            if any(r.case_id in changed for r in rs):
+                flag += "  [case changed since recording]"
+            s_txt = f"{s_p}/{s_n}" if run.self_judge else "-"
+            lines.append(f"  {c.id:28} {c.category:22} S {s_txt:5}  P {p_p}/{len(q)}{flag}")
+        lines.append("")
+
+    lines.append("PER ANSWER  (S = self verdict, P = panel verdict with split; 'no quorum' = too few usable judge verdicts)")
     for r in run.results:
         c = by_id[r.case_id]
         s = _s(r.self_verdict.passed) if r.self_verdict is not None else "-"
@@ -136,7 +181,8 @@ def render(run: Run, cases: list[Case], changed_cases: list[str] | None = None) 
             r.self_verdict is not None and r.self_verdict.passed is not None and r.panel_quorum and r.self_verdict.passed != r.panel_passed
         )
         flag = ("  <- DISAGREE" if disagree else "") + ("  [case changed since recording]" if r.case_id in changed else "")
-        lines.append(f"  {c.id:28} {c.category:22} S {s:4}  P {p:4} {split}{flag}")
+        rep_tag = f" #{r.repeat + 1}" if run.repeats > 1 else ""
+        lines.append(f"  {c.id + rep_tag:28} {c.category:22} S {s:4}  P {p:4} {split}{flag}")
     lines.append("")
 
     disagreements = [
@@ -148,7 +194,7 @@ def render(run: Run, cases: list[Case], changed_cases: list[str] | None = None) 
         lines.append("DISAGREEMENTS  (read these; a disagreement is a case for a human, not a verdict)")
         for r in disagreements:
             c = by_id[r.case_id]
-            lines.append(f"  {c.id}: {c.title}")
+            lines.append(f"  {c.id}{f' #{r.repeat + 1}' if run.repeats > 1 else ''}: {c.title}")
             lines.append(f"    answer: {r.answer.text[:300].replace(chr(10), ' ')}{'…' if len(r.answer.text) > 300 else ''}")
             assert r.self_verdict is not None
             lines.append(
@@ -170,6 +216,12 @@ def render(run: Run, cases: list[Case], changed_cases: list[str] | None = None) 
             lines.append(f"  {cid}: panel {j}")
         for cid in self_abst:
             lines.append(f"  {cid}: self-judge")
+        lines.append("")
+
+    if run.errors:
+        lines.append("ERRORS  (calls that failed; these answers do not exist and are not counted anywhere above)")
+        for e in run.errors:
+            lines.append(f"  {e.case_id} #{e.repeat + 1} {e.stage}: {e.error}")
         lines.append("")
 
     tok_in = sum(r.answer.usage.input_tokens or 0 for r in run.results)

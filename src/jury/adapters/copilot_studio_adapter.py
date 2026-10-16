@@ -102,5 +102,10 @@ class CopilotStudioTarget:
 
 
 @register("copilot-studio")
-def _factory(agent: str) -> Target:
+def _factory(agent: str, temperature: float | None) -> Target:
+    """Sampling is fixed in the agent's build; a requested temperature is refused rather than silently ignored."""
+    if temperature is not None:
+        raise ValueError(
+            "copilot-studio: temperature is set in the agent's configuration, not per call; omit --temperature for this target"
+        )
     return CopilotStudioTarget(agent)

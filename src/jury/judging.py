@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import re
 from collections import Counter
+from typing import NamedTuple
 
 from jury.types import Case, Message, Reply, Target, Verdict
 
@@ -65,9 +66,7 @@ def parse_verdict(judge_id: str, text: str, reported_model: str | None = None) -
         )
     try:
         data = json.loads(m.group(0))
-        raw_pass = data["pass"]
-        if not isinstance(raw_pass, bool):
-            raise TypeError(f"pass must be true or false, got {raw_pass!r}")
+        raw_pass = _as_bool(data["pass"])
         conf = float(data.get("confidence", 0.5))
         reasons = [str(r) for r in data.get("reasons", [])]
     except (KeyError, ValueError, TypeError, json.JSONDecodeError) as e:
@@ -85,8 +84,32 @@ def parse_verdict(judge_id: str, text: str, reported_model: str | None = None) -
     )
 
 
+def _as_bool(value: object) -> bool:
+    """The verdict's pass field. JSON true/false, or the words true/false as a string; nothing else.
+
+    A judge that writes "pass": "false" has said false and is counted as saying
+    false. A judge that writes "pass": "mostly" has not given a verdict.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str) and value.strip().lower() in {"true", "false"}:
+        return value.strip().lower() == "true"
+    raise TypeError(f"pass must be true or false, got {value!r}")
+
+
 async def judge_one(judge: Target, case: Case, answer: Reply) -> Verdict:
-    reply = await judge.ask(judge_prompt(case, answer))
+    """One judge's verdict. A failed call is an abstention with the error recorded, never a lost run."""
+    try:
+        reply = await judge.ask(judge_prompt(case, answer))
+    except Exception as e:
+        return Verdict(
+            judge=judge.id,
+            passed=None,
+            confidence=0.0,
+            reasons=[f"judge call failed: {type(e).__name__}: {e}"],
+            raw_text="",
+            parse_ok=False,
+        )
     return parse_verdict(judge.id, reply.text, reported_model=reply.model)
 
 
@@ -114,3 +137,42 @@ def majority(verdicts: list[Verdict], configured: int | None = None) -> tuple[bo
 def inflation(self_pass_rate: float, panel_pass_rate: float) -> float:
     """How much more generous the model is to itself than the panel is, in percentage points."""
     return round((self_pass_rate - panel_pass_rate) * 100, 1)
+
+
+class Agreement(NamedTuple):
+    """How much the judges agree with each other, over every usable pair of verdicts."""
+
+    pairs: int
+    pairwise: float  # share of judge pairs (same answer) that gave the same verdict
+    unanimous: float  # share of answers with a quorum where every usable verdict was the same
+    with_majority: dict[str, float]  # per judge: share of its usable verdicts that matched the panel majority
+
+
+def agreement(results: list[tuple[list[Verdict], bool | None]]) -> Agreement:
+    """results: (panel verdicts, panel verdict or None if no quorum) per answer.
+
+    Pairwise agreement is observed agreement, not chance-corrected: with a
+    strong target most judges say pass most of the time and agreement is
+    high for that reason alone. Read it with the per-judge figures, which
+    show which judge is the outlier.
+    """
+    pairs = agree = 0
+    quorum_n = unanimous = 0
+    per_judge: dict[str, list[bool]] = {}
+    for verdicts, panel in results:
+        usable = [v for v in verdicts if v.passed is not None]
+        for i in range(len(usable)):
+            for j in range(i + 1, len(usable)):
+                pairs += 1
+                agree += usable[i].passed == usable[j].passed
+        if panel is not None:
+            quorum_n += 1
+            unanimous += len({v.passed for v in usable}) == 1
+            for v in usable:
+                per_judge.setdefault(v.judge, []).append(v.passed == panel)
+    return Agreement(
+        pairs=pairs,
+        pairwise=agree / pairs if pairs else 0.0,
+        unanimous=unanimous / quorum_n if quorum_n else 0.0,
+        with_majority={j: sum(x) / len(x) for j, x in per_judge.items()},
+    )

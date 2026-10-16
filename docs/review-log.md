@@ -53,3 +53,41 @@ judges are not necessarily three independent opinions.
 not add providers, categories, a dashboard or a database. Agreed; none
 were added. The Copilot Studio adapter remains documented as not yet run
 against a live agent.
+
+## Review 2 (commit `e4d7cb3` reviewed)
+
+**A judge writing `"pass": "false"` as a string.** After review 1 that was
+an abstention (non-boolean); before it, `bool("false")` would have been a
+pass, the exact failure the tool exists to catch. Fixed: the strings
+`true` and `false` (any case) are votes; anything else still abstains. A
+test pins `"false"` as a fail vote.
+
+**One failed API call lost the whole run.** Nothing was saved until the
+end and an exception anywhere propagated out. Fixed: the recording is
+written after every answer; a target call that fails is recorded under
+`errors` and the other cases continue; a judge call that fails is an
+abstention carrying the error; `jury run --resume <recording>` finishes a
+partial run, sending only the missing (case, repeat) pairs, and refuses
+if the target or panel differ from the recording.
+
+**One answer per case, no temperature control, no measure of whether the
+judges agree.** Fixed: `--repeats N` sends each case N times;
+`--temperature` and `--judge-temperature` (default 0) are passed to the
+adapters and recorded in the run (a Copilot Studio agent refuses a
+temperature rather than ignoring one). The report shows passes per
+repeat for each case and marks inconsistent ones, and a judge-agreement
+block gives pairwise agreement, the unanimous share, and each judge's
+agreement with the panel majority.
+
+**The README's example put the target on its own panel.** Fixed: the
+example uses three other models; `jury run` warns if a judge id equals
+the target id, the run records `panel_includes_target`, and the report
+carries a warning. The README "Why" now says the original finding came
+from five runs and a three-model panel, without claiming the panel
+excluded the target.
+
+**Model ids.** The reviewer said `claude-haiku-5-5` does not exist. It
+does; the reviewer's model list was out of date. The README now says the
+ids in the example are examples and to use whatever the account lists.
+
+43 tests.

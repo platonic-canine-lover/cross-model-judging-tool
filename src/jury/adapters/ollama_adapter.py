@@ -11,14 +11,17 @@ from jury.types import Message, Reply, Target, Usage
 
 
 class OllamaTarget:
-    def __init__(self, model: str, host: str | None = None, timeout: float = 600.0) -> None:
+    def __init__(self, model: str, host: str | None = None, timeout: float = 600.0, temperature: float | None = None) -> None:
         self.id = f"ollama:{model}"
         self.model = model
         self.host = (host or os.environ.get("OLLAMA_HOST") or "http://localhost:11434").rstrip("/")
         self.timeout = timeout
+        self.temperature = temperature
 
     async def ask(self, messages: list[Message]) -> Reply:
-        payload = {"model": self.model, "messages": [m.model_dump() for m in messages], "stream": False}
+        payload: dict[str, object] = {"model": self.model, "messages": [m.model_dump() for m in messages], "stream": False}
+        if self.temperature is not None:
+            payload["options"] = {"temperature": self.temperature}
         async with httpx.AsyncClient(timeout=self.timeout) as client:
             r = await client.post(f"{self.host}/api/chat", json=payload)
             r.raise_for_status()
@@ -32,5 +35,5 @@ class OllamaTarget:
 
 
 @register("ollama")
-def _factory(model: str) -> Target:
-    return OllamaTarget(model)
+def _factory(model: str, temperature: float | None) -> Target:
+    return OllamaTarget(model, temperature=temperature)

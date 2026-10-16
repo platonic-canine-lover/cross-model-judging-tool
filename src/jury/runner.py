@@ -17,7 +17,7 @@ from pathlib import Path
 import yaml
 
 from jury.judging import judge_one, majority
-from jury.types import Case, CaseResult, Message, Reply, Run, Target
+from jury.types import Case, CaseResult, Message, Reply, Run, RunError, Target
 
 
 def load_cases(directory: Path) -> list[Case]:
@@ -62,6 +62,10 @@ def check_cases_against(run: Run, cases: list[Case], allow_changed: bool = False
     return changed
 
 
+def new_run_id() -> str:
+    return f"{datetime.now(UTC):%Y%m%d-%H%M%S}-{uuid.uuid4().hex[:6]}"
+
+
 def messages_for(case: Case) -> list[Message]:
     msgs: list[Message] = []
     if case.system:
@@ -77,36 +81,96 @@ async def run_cases(
     cases_dir: Path,
     self_judge: Target | None,
     concurrency: int = 3,
+    repeats: int = 1,
+    temperature: float | None = None,
+    judge_temperature: float | None = None,
+    checkpoint: Path | None = None,
+    resume: Run | None = None,
+    run_id: str | None = None,
 ) -> Run:
-    run = Run(
-        run_id=f"{datetime.now(UTC):%Y%m%d-%H%M%S}-{uuid.uuid4().hex[:6]}",
-        target=target.id,
-        judges=[j.id for j in judges],
-        self_judge=self_judge is not None,
-        cases_dir=str(cases_dir),
-        live={t.id: True for t in [target, *judges, *([self_judge] if self_judge else [])]},
-        case_fingerprints={c.id: fingerprint(c) for c in cases},
-    )
-    sem = asyncio.Semaphore(concurrency)
+    """Send every case to the target `repeats` times, judge each answer, and record as you go.
 
-    async def one(case: Case) -> CaseResult:
+    Each (case, repeat) is independent: a failed target call is recorded in
+    `run.errors` and the rest of the run continues. After every result the
+    whole run is written to `checkpoint` (if given), so an interrupted run
+    is a partial recording, not nothing. Pass the partial recording as
+    `resume` to finish it: completed results are kept, and only the
+    missing or errored (case, repeat) pairs are sent.
+    """
+    if repeats < 1:
+        raise ValueError("repeats must be at least 1")
+    if resume is not None:
+        mismatch = [
+            name
+            for name, want, have in [
+                ("target", target.id, resume.target),
+                ("judges", [j.id for j in judges], resume.judges),
+                ("repeats", repeats, resume.repeats),
+            ]
+            if want != have
+        ]
+        if mismatch:
+            raise ValueError(f"cannot resume: {', '.join(mismatch)} differ from the recording")
+        check_cases_against(resume, cases)
+        run = resume.model_copy(update={"errors": [], "complete": False})
+    else:
+        run = Run(
+            run_id=run_id or new_run_id(),
+            target=target.id,
+            judges=[j.id for j in judges],
+            self_judge=self_judge is not None,
+            cases_dir=str(cases_dir),
+            repeats=repeats,
+            temperature=temperature,
+            judge_temperature=judge_temperature,
+            panel_includes_target=any(j.id == target.id for j in judges),
+            live={t.id: True for t in [target, *judges, *([self_judge] if self_judge else [])]},
+            case_fingerprints={c.id: fingerprint(c) for c in cases},
+        )
+    done = {(r.case_id, r.repeat) for r in run.results}
+    todo = [(c, k) for c in cases for k in range(repeats) if (c.id, k) not in done]
+    sem = asyncio.Semaphore(concurrency)
+    lock = asyncio.Lock()
+
+    async def record(result: CaseResult | RunError) -> None:
+        async with lock:
+            if isinstance(result, CaseResult):
+                run.results.append(result)
+            else:
+                run.errors.append(result)
+            if checkpoint is not None:
+                save(run, checkpoint)
+
+    async def one(case: Case, k: int) -> None:
         async with sem:
-            answer = await target.ask(messages_for(case))
+            try:
+                answer = await target.ask(messages_for(case))
+            except Exception as e:
+                await record(RunError(case_id=case.id, repeat=k, stage="target", error=f"{type(e).__name__}: {e}"))
+                return
             sv = await judge_one(self_judge, case, answer) if self_judge else None
             pv = list(await asyncio.gather(*(judge_one(j, case, answer) for j in judges)))
             passed, split, quorum = majority(pv, configured=len(judges))
-            return CaseResult(
-                case_id=case.id,
-                target=target.id,
-                answer=answer,
-                self_verdict=sv,
-                panel_verdicts=pv,
-                panel_passed=passed,
-                panel_split=split,
-                panel_quorum=quorum,
+            await record(
+                CaseResult(
+                    case_id=case.id,
+                    repeat=k,
+                    target=target.id,
+                    answer=answer,
+                    self_verdict=sv,
+                    panel_verdicts=pv,
+                    panel_passed=passed,
+                    panel_split=split,
+                    panel_quorum=quorum,
+                )
             )
 
-    run.results = list(await asyncio.gather(*(one(c) for c in cases)))
+    await asyncio.gather(*(one(c, k) for c, k in todo))
+    order = {c.id: i for i, c in enumerate(cases)}
+    run.results.sort(key=lambda r: (order.get(r.case_id, len(order)), r.repeat))
+    run.complete = not run.errors
+    if checkpoint is not None:
+        save(run, checkpoint)
     return run
 
 
@@ -124,17 +188,23 @@ class ReplayTarget:
 
     def __init__(self, run: Run) -> None:
         self.id = run.target
-        self._answers: dict[str, Reply] = {r.case_id: r.answer for r in run.results}
-        self._by_prompt: dict[str, Reply] = {}
+        self._answers: dict[tuple[str, int], Reply] = {(r.case_id, r.repeat): r.answer for r in run.results}
 
-    def answer_for(self, case_id: str) -> Reply:
-        return self._answers[case_id]
+    def answer_for(self, case_id: str, repeat: int = 0) -> Reply:
+        return self._answers[(case_id, repeat)]
 
     async def ask(self, messages: list[Message]) -> Reply:  # pragma: no cover - the runner calls answer_for via rejudge
         raise RuntimeError("ReplayTarget answers by case id; use rejudge()")
 
 
-async def rejudge(run: Run, judges: list[Target], cases: list[Case], self_judge: Target | None = None, allow_changed: bool = False) -> Run:
+async def rejudge(
+    run: Run,
+    judges: list[Target],
+    cases: list[Case],
+    self_judge: Target | None = None,
+    allow_changed: bool = False,
+    judge_temperature: float | None = None,
+) -> Run:
     """Re-grade a recorded run's answers with a different panel. No target calls.
 
     Refuses if the case set no longer contains every recorded case, or if any
@@ -150,19 +220,22 @@ async def rejudge(run: Run, judges: list[Target], cases: list[Case], self_judge:
             "results": [],
             "live": {**{k: False for k in run.live}, **{j.id: True for j in judges}},
             "case_fingerprints": {c.id: fingerprint(c) for c in cases if c.id in {r.case_id for r in run.results}},
+            "panel_includes_target": any(j.id == run.target for j in judges),
+            "judge_temperature": judge_temperature,
         }
     )
     by_id = {c.id: c for c in cases}
     results: list[CaseResult] = []
     for r in run.results:
         case = by_id[r.case_id]
-        answer = replay.answer_for(r.case_id)
+        answer = replay.answer_for(r.case_id, r.repeat)
         sv = await judge_one(self_judge, case, answer) if self_judge else None
         pv = list(await asyncio.gather(*(judge_one(j, case, answer) for j in judges)))
         passed, split, quorum = majority(pv, configured=len(judges))
         results.append(
             CaseResult(
                 case_id=case.id,
+                repeat=r.repeat,
                 target=run.target,
                 answer=answer,
                 self_verdict=sv,
