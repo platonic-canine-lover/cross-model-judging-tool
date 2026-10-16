@@ -30,10 +30,11 @@ class ScriptedTarget:
 class RuleJudge:
     """Grades by calling a Python predicate on the answer text, replying in the JSON the harness expects."""
 
-    def __init__(self, id: str, rule: Callable[[str], bool], json_ok: bool = True) -> None:
+    def __init__(self, id: str, rule: Callable[[str], bool], json_ok: bool = True, reported_model: str | None = None) -> None:
         self.id = id
         self.rule = rule
         self.json_ok = json_ok
+        self.reported_model = reported_model or id
         self.calls = 0
 
     async def ask(self, messages: list[Message]) -> Reply:
@@ -41,6 +42,8 @@ class RuleJudge:
         prompt = messages[-1].content
         answer = prompt.split("<<<\n", 1)[1].split("\n>>>", 1)[0]
         if not self.json_ok:
-            return Reply(text="I think it's fine, honestly.", model=self.id)
+            return Reply(text="I think it's fine, honestly.", model=self.reported_model)
         passed = self.rule(answer)
-        return Reply(text=f'{{"pass": {str(passed).lower()}, "confidence": 0.9, "reasons": ["rule says {passed}"]}}', model=self.id)
+        return Reply(
+            text=f'{{"pass": {str(passed).lower()}, "confidence": 0.9, "reasons": ["rule says {passed}"]}}', model=self.reported_model
+        )

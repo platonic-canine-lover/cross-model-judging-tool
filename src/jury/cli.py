@@ -10,7 +10,7 @@ import typer
 
 from jury.adapters import providers, resolve
 from jury.report import render
-from jury.runner import load, load_cases, rejudge, run_cases, save
+from jury.runner import CaseSetMismatchError, check_cases_against, load, load_cases, rejudge, run_cases, save
 
 app = typer.Typer(add_completion=False, help="Put an agent through a case set; judge it by itself and by a panel; report the disagreement.")
 
@@ -46,9 +46,14 @@ def report(
     recording: Annotated[Path, typer.Argument(help="a run recording (runs/*.json)")],
     cases: Annotated[Path, typer.Option(help="the case directory the run used")] = Path("cases"),
 ) -> None:
-    """Print the report for a saved recording. No network."""
+    """Print the report for a saved recording. No network. Cases that changed since the recording are flagged."""
     r = load(recording)
-    typer.echo(render(r, load_cases(cases)))
+    case_list = load_cases(cases)
+    try:
+        changed = check_cases_against(r, case_list, allow_changed=True)
+    except CaseSetMismatchError as e:
+        raise typer.BadParameter(str(e)) from e
+    typer.echo(render(r, case_list, changed_cases=changed))
 
 
 @app.command("rejudge")
@@ -58,16 +63,26 @@ def rejudge_cmd(
     cases: Annotated[Path, typer.Option()] = Path("cases"),
     out: Annotated[Path | None, typer.Option()] = None,
     self_judge_as: Annotated[str | None, typer.Option(help="model to self-judge with; omit for no self-judge")] = None,
+    allow_changed: Annotated[
+        bool, typer.Option("--allow-changed", help="proceed even if case definitions changed since the recording; the report marks them")
+    ] = False,
 ) -> None:
-    """Grade a recording's answers again with a different panel. Calls the judges, not the target."""
+    """Grade a recording's answers again with a different panel. Calls the judges, not the target.
+
+    Refuses if the case set is missing a recorded case, or if any case changed since the recording (unless --allow-changed).
+    """
     r = load(recording)
     case_list = load_cases(cases)
     judges = [resolve(j) for j in judge]
     sj = resolve(self_judge_as) if self_judge_as else None
-    new = asyncio.run(rejudge(r, judges, case_list, sj))
+    try:
+        changed = check_cases_against(r, case_list, allow_changed=allow_changed)
+        new = asyncio.run(rejudge(r, judges, case_list, sj, allow_changed=allow_changed))
+    except CaseSetMismatchError as e:
+        raise typer.BadParameter(str(e)) from e
     path = out or recording.with_name(recording.stem + "-rejudged.json")
     save(new, path)
-    typer.echo(render(new, case_list))
+    typer.echo(render(new, case_list, changed_cases=changed))
     typer.echo(f"\nrecording: {path}")
 
 

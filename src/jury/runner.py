@@ -8,6 +8,7 @@ and CI replay committed recordings, so neither needs a key.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import uuid
 from datetime import UTC, datetime
@@ -30,6 +31,35 @@ def load_cases(directory: Path) -> list[Case]:
     if dupes:
         raise ValueError(f"duplicate case ids: {sorted(dupes)}")
     return cases
+
+
+def fingerprint(case: Case) -> str:
+    """sha256 of everything a judge or target sees for the case, so edits are detectable."""
+    payload = case.model_dump(mode="json", exclude={"notes"})
+    return hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()[:16]
+
+
+class CaseSetMismatchError(ValueError):
+    """The case definitions supplied do not match the ones a recording was made with."""
+
+
+def check_cases_against(run: Run, cases: list[Case], allow_changed: bool = False) -> list[str]:
+    """Every recorded case must still exist; changed cases are listed, and refused unless allowed.
+
+    Returns the ids whose definition changed since the recording (empty if none).
+    """
+    by_id = {c.id: c for c in cases}
+    missing = [r.case_id for r in run.results if r.case_id not in by_id]
+    if missing:
+        raise CaseSetMismatchError(f"recording refers to case ids not in the supplied case set: {', '.join(missing)}")
+    changed = [cid for cid, fp in run.case_fingerprints.items() if cid in by_id and fingerprint(by_id[cid]) != fp]
+    if changed and not allow_changed:
+        raise CaseSetMismatchError(
+            "these cases have changed since the recording was made, so verdicts would not be comparable: "
+            + ", ".join(changed)
+            + ". Rejudge with allow_changed to proceed; the report will mark them."
+        )
+    return changed
 
 
 def messages_for(case: Case) -> list[Message]:
@@ -55,6 +85,7 @@ async def run_cases(
         self_judge=self_judge is not None,
         cases_dir=str(cases_dir),
         live={t.id: True for t in [target, *judges, *([self_judge] if self_judge else [])]},
+        case_fingerprints={c.id: fingerprint(c) for c in cases},
     )
     sem = asyncio.Semaphore(concurrency)
 
@@ -63,9 +94,16 @@ async def run_cases(
             answer = await target.ask(messages_for(case))
             sv = await judge_one(self_judge, case, answer) if self_judge else None
             pv = list(await asyncio.gather(*(judge_one(j, case, answer) for j in judges)))
-            passed, split = majority(pv)
+            passed, split, quorum = majority(pv, configured=len(judges))
             return CaseResult(
-                case_id=case.id, target=target.id, answer=answer, self_verdict=sv, panel_verdicts=pv, panel_passed=passed, panel_split=split
+                case_id=case.id,
+                target=target.id,
+                answer=answer,
+                self_verdict=sv,
+                panel_verdicts=pv,
+                panel_passed=passed,
+                panel_split=split,
+                panel_quorum=quorum,
             )
 
     run.results = list(await asyncio.gather(*(one(c) for c in cases)))
@@ -96,8 +134,14 @@ class ReplayTarget:
         raise RuntimeError("ReplayTarget answers by case id; use rejudge()")
 
 
-async def rejudge(run: Run, judges: list[Target], cases: list[Case], self_judge: Target | None = None) -> Run:
-    """Re-grade a recorded run's answers with a different panel. No target calls."""
+async def rejudge(run: Run, judges: list[Target], cases: list[Case], self_judge: Target | None = None, allow_changed: bool = False) -> Run:
+    """Re-grade a recorded run's answers with a different panel. No target calls.
+
+    Refuses if the case set no longer contains every recorded case, or if any
+    case definition changed since the recording (unless allow_changed, in
+    which case the new fingerprints are recorded and the report flags them).
+    """
+    check_cases_against(run, cases, allow_changed=allow_changed)
     replay = ReplayTarget(run)
     new = run.model_copy(
         update={
@@ -105,6 +149,7 @@ async def rejudge(run: Run, judges: list[Target], cases: list[Case], self_judge:
             "self_judge": self_judge is not None,
             "results": [],
             "live": {**{k: False for k in run.live}, **{j.id: True for j in judges}},
+            "case_fingerprints": {c.id: fingerprint(c) for c in cases if c.id in {r.case_id for r in run.results}},
         }
     )
     by_id = {c.id: c for c in cases}
@@ -114,7 +159,7 @@ async def rejudge(run: Run, judges: list[Target], cases: list[Case], self_judge:
         answer = replay.answer_for(r.case_id)
         sv = await judge_one(self_judge, case, answer) if self_judge else None
         pv = list(await asyncio.gather(*(judge_one(j, case, answer) for j in judges)))
-        passed, split = majority(pv)
+        passed, split, quorum = majority(pv, configured=len(judges))
         results.append(
             CaseResult(
                 case_id=case.id,
@@ -124,6 +169,7 @@ async def rejudge(run: Run, judges: list[Target], cases: list[Case], self_judge:
                 panel_verdicts=pv,
                 panel_passed=passed,
                 panel_split=split,
+                panel_quorum=quorum,
             )
         )
     new.results = results

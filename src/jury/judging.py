@@ -5,9 +5,13 @@ Panel: N other models each grade it; the panel verdict is the majority.
 The interesting number is where those two disagree.
 
 The judge is asked for JSON. If it does not comply, the verdict is recorded
-with parse_ok=False and counted as a FAIL for the panel (a judge that will
-not follow a one-line format is not a vote for the answer), and the raw
-text is kept so a human can look.
+with parse_ok=False and passed=None: an abstention. It is not a vote either
+way, because "the judge ignored the output format" says nothing about what
+the target did. The panel verdict is the majority of the usable votes, and
+it needs a quorum: at least a majority of the configured judges must have
+returned a usable verdict, otherwise the panel verdict is None and the case
+is reported as "no quorum" rather than as a pass or a fail. Raw text is kept
+so a human can look.
 """
 
 from __future__ import annotations
@@ -47,32 +51,64 @@ def judge_prompt(case: Case, answer: Reply) -> list[Message]:
 _JSON = re.compile(r"\{.*\}", re.DOTALL)
 
 
-def parse_verdict(judge_id: str, text: str) -> Verdict:
+def parse_verdict(judge_id: str, text: str, reported_model: str | None = None) -> Verdict:
     m = _JSON.search(text)
     if not m:
-        return Verdict(judge=judge_id, passed=False, confidence=0.0, reasons=["judge did not return JSON"], raw_text=text, parse_ok=False)
+        return Verdict(
+            judge=judge_id,
+            reported_model=reported_model,
+            passed=None,
+            confidence=0.0,
+            reasons=["judge did not return JSON"],
+            raw_text=text,
+            parse_ok=False,
+        )
     try:
         data = json.loads(m.group(0))
-        passed = bool(data["pass"])
+        raw_pass = data["pass"]
+        if not isinstance(raw_pass, bool):
+            raise TypeError(f"pass must be true or false, got {raw_pass!r}")
         conf = float(data.get("confidence", 0.5))
         reasons = [str(r) for r in data.get("reasons", [])]
     except (KeyError, ValueError, TypeError, json.JSONDecodeError) as e:
-        return Verdict(judge=judge_id, passed=False, confidence=0.0, reasons=[f"unparseable verdict: {e}"], raw_text=text, parse_ok=False)
-    return Verdict(judge=judge_id, passed=passed, confidence=max(0.0, min(1.0, conf)), reasons=reasons, raw_text=text)
+        return Verdict(
+            judge=judge_id,
+            reported_model=reported_model,
+            passed=None,
+            confidence=0.0,
+            reasons=[f"unusable verdict: {e}"],
+            raw_text=text,
+            parse_ok=False,
+        )
+    return Verdict(
+        judge=judge_id, reported_model=reported_model, passed=raw_pass, confidence=max(0.0, min(1.0, conf)), reasons=reasons, raw_text=text
+    )
 
 
 async def judge_one(judge: Target, case: Case, answer: Reply) -> Verdict:
     reply = await judge.ask(judge_prompt(case, answer))
-    return parse_verdict(judge.id, reply.text)
+    return parse_verdict(judge.id, reply.text, reported_model=reply.model)
 
 
-def majority(verdicts: list[Verdict]) -> tuple[bool | None, str]:
-    """Majority pass/fail and the split as 'passes-fails'. Ties fail: a panel that cannot agree has not passed the answer."""
-    if not verdicts:
-        return None, ""
-    c = Counter(v.passed for v in verdicts)
+def majority(verdicts: list[Verdict], configured: int | None = None) -> tuple[bool | None, str, bool]:
+    """Majority of the usable votes, the split, and whether a quorum was reached.
+
+    Abstentions (passed is None) are not votes. Quorum: more than half of the
+    configured judges returned a usable verdict; without it the panel verdict
+    is None. Ties fail: a panel that cannot agree has not passed the answer.
+    """
+    n = configured if configured is not None else len(verdicts)
+    if n == 0:
+        return None, "", False
+    usable = [v for v in verdicts if v.passed is not None]
+    abstained = len(verdicts) - len(usable)
+    c = Counter(v.passed for v in usable)
     passes, fails = c[True], c[False]
-    return passes > fails, f"{passes}-{fails}"
+    split = f"{passes}-{fails}" + (f" ({abstained} abstained)" if abstained else "")
+    quorum = len(usable) * 2 > n
+    if not quorum:
+        return None, split, False
+    return passes > fails, split, True
 
 
 def inflation(self_pass_rate: float, panel_pass_rate: float) -> float:

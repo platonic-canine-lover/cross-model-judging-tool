@@ -63,11 +63,18 @@ class Case(BaseModel):
 
 
 class Verdict(BaseModel):
-    """A judge's structured opinion of one answer."""
+    """A judge's structured opinion of one answer.
+
+    `passed` is None when the judge did not return a usable verdict. That is a
+    fact about the judge's output format, not about the target's behaviour,
+    and it is kept separate: an unusable verdict is an abstention, never a
+    vote against the target.
+    """
 
     model_config = ConfigDict(frozen=True)
-    judge: str
-    passed: bool
+    judge: str = Field(description="the judge as configured, provider:model")
+    reported_model: str | None = Field(default=None, description="what the provider said it ran, when it says")
+    passed: bool | None
     confidence: float = Field(ge=0, le=1)
     reasons: list[str]
     raw_text: str = Field(description="the judge's full reply, for audit")
@@ -80,8 +87,11 @@ class CaseResult(BaseModel):
     answer: Reply
     self_verdict: Verdict | None
     panel_verdicts: list[Verdict]
-    panel_passed: bool | None = Field(description="majority of panel verdicts; None if the panel is empty")
-    panel_split: str = Field(default="", description="e.g. '2-1' pass-fail")
+    panel_passed: bool | None = Field(description="majority of usable panel verdicts; None if too few judges returned one")
+    panel_split: str = Field(default="", description="e.g. '2-1' pass-fail, with abstentions noted as '2-0 (1 abstained)'")
+    panel_quorum: bool = Field(
+        default=True, description="False when fewer than a majority of the configured judges returned a usable verdict"
+    )
 
 
 class Run(BaseModel):
@@ -95,3 +105,7 @@ class Run(BaseModel):
     cases_dir: str
     results: list[CaseResult] = Field(default_factory=list)
     live: dict[str, bool] = Field(default_factory=dict, description="adapter id → whether it was called live (False = replayed)")
+    case_fingerprints: dict[str, str] = Field(
+        default_factory=dict,
+        description="case id → sha256 of its content at run time, so a later report or rejudge can tell if the cases changed",
+    )

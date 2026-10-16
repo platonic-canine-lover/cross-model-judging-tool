@@ -1,4 +1,15 @@
-"""The report: self-judge vs panel, per category and per case, and where they disagree."""
+"""The report: self-judge vs panel, per category and per case, and where they disagree.
+
+Vocabulary, used consistently:
+  self-judged pass rate      share of cases the target's own model passed
+  panel-judged pass rate     share of cases the panel's majority passed, counted over cases WITH a quorum
+  self-grade inflation       self-judged minus panel-judged, in points. It is a difference between two
+  relative to the panel      opinions. It is not a measure of the target's actual accuracy, because the
+                             panel is three other models, not ground truth.
+  abstained                  a judge returned no usable verdict (format failure); not a vote
+  no quorum                  fewer than a majority of the configured judges returned usable verdicts;
+                             the case has no panel verdict and is excluded from the panel pass rate
+"""
 
 from __future__ import annotations
 
@@ -12,6 +23,7 @@ from jury.types import Case, Run
 @dataclass
 class Rates:
     n: int
+    n_with_quorum: int
     self_pass: int
     panel_pass: int
     agree: int
@@ -24,15 +36,17 @@ class Rates:
 
     @property
     def panel_rate(self) -> float:
-        return self.panel_pass / self.n if self.n else 0.0
+        return self.panel_pass / self.n_with_quorum if self.n_with_quorum else 0.0
 
 
 def rates(run: Run, case_ids: list[str] | None = None) -> Rates:
     rs = [r for r in run.results if case_ids is None or r.case_id in case_ids]
-    r = Rates(n=len(rs), self_pass=0, panel_pass=0, agree=0, self_yes_panel_no=0, self_no_panel_yes=0)
+    r = Rates(n=len(rs), n_with_quorum=0, self_pass=0, panel_pass=0, agree=0, self_yes_panel_no=0, self_no_panel_yes=0)
     for x in rs:
         s = x.self_verdict.passed if x.self_verdict else None
-        p = x.panel_passed
+        p = x.panel_passed if x.panel_quorum else None
+        if x.panel_quorum:
+            r.n_with_quorum += 1
         if s:
             r.self_pass += 1
         if p:
@@ -51,26 +65,52 @@ def pct(x: float) -> str:
     return f"{x * 100:.0f}%"
 
 
-def render(run: Run, cases: list[Case]) -> str:
+def _judge_label(v_judge: str, reported: str | None) -> str:
+    if reported and reported != v_judge and not v_judge.endswith(":" + reported):
+        return f"{v_judge} (reported {reported})"
+    return v_judge
+
+
+def _s(v: object) -> str:
+    """Render a tri-state verdict."""
+    if v is None:
+        return "-"
+    return "pass" if v else "FAIL"
+
+
+def render(run: Run, cases: list[Case], changed_cases: list[str] | None = None) -> str:
     by_id = {c.id: c for c in cases}
+    changed = set(changed_cases or [])
     lines: list[str] = []
     lines.append(f"CROSS-MODEL JUDGING REPORT  run {run.run_id}  {run.started_at:%Y-%m-%d %H:%M} UTC")
     lines.append(f"target: {run.target}    panel: {', '.join(run.judges)}    self-judge: {'yes' if run.self_judge else 'no'}")
     live = [k for k, v in run.live.items() if v]
     replayed = [k for k, v in run.live.items() if not v]
     lines.append(f"live calls: {', '.join(live) or 'none'}" + (f"    replayed from recording: {', '.join(replayed)}" if replayed else ""))
+    reported = sorted({_judge_label(v.judge, v.reported_model) for r in run.results for v in r.panel_verdicts if v.reported_model})
+    if any("(reported" in x for x in reported):
+        lines.append("judge identities as reported by providers: " + ", ".join(x for x in reported if "(reported" in x))
+    if changed:
+        lines.append(
+            f"WARNING: {len(changed)} case definition(s) changed since this recording was made: {', '.join(sorted(changed))}. Verdicts on them are not comparable with the original run."
+        )
     lines.append("")
 
     overall = rates(run)
+    no_quorum = overall.n - overall.n_with_quorum
     lines.append("OVERALL")
-    lines.append(f"  cases {overall.n}")
+    lines.append(f"  cases {overall.n}" + (f" ({no_quorum} without a panel quorum, excluded from the panel rate)" if no_quorum else ""))
     if run.self_judge:
-        lines.append(f"  self-judged pass rate   {pct(overall.self_rate)}  ({overall.self_pass}/{overall.n})")
-    lines.append(f"  panel-judged pass rate  {pct(overall.panel_rate)}  ({overall.panel_pass}/{overall.n}, majority of {len(run.judges)})")
+        lines.append(f"  self-judged pass rate                     {pct(overall.self_rate)}  ({overall.self_pass}/{overall.n})")
+    lines.append(
+        f"  panel-judged pass rate                    {pct(overall.panel_rate)}  ({overall.panel_pass}/{overall.n_with_quorum}, majority of {len(run.judges)} judges, usable verdicts only)"
+    )
     if run.self_judge:
-        lines.append(f"  self-grade inflation    {inflation(overall.self_rate, overall.panel_rate):+.1f} points (self minus panel)")
         lines.append(
-            f"  agreement               {overall.agree}/{overall.n}; self yes / panel no: {overall.self_yes_panel_no}; self no / panel yes: {overall.self_no_panel_yes}"
+            f"  self-grade inflation relative to panel    {inflation(overall.self_rate, overall.panel_rate):+.1f} points (self minus panel; a difference of opinion, not a measure of accuracy)"
+        )
+        lines.append(
+            f"  agreement                                 {overall.agree}/{overall.n_with_quorum}; self yes / panel no: {overall.self_yes_panel_no}; self no / panel yes: {overall.self_no_panel_yes}"
         )
     lines.append("")
 
@@ -86,40 +126,50 @@ def render(run: Run, cases: list[Case]) -> str:
             lines.append(f"  {cat:32} {pct(rt.panel_rate):>5}")
     lines.append("")
 
-    lines.append("PER CASE  (S = self verdict, P = panel verdict with split)")
+    lines.append("PER CASE  (S = self verdict, P = panel verdict with split; 'no quorum' = too few usable judge verdicts)")
     for r in run.results:
         c = by_id[r.case_id]
-        s = "-" if r.self_verdict is None else ("pass" if r.self_verdict.passed else "FAIL")
-        p = "-" if r.panel_passed is None else ("pass" if r.panel_passed else "FAIL")
-        flag = (
-            "  <- DISAGREE" if r.self_verdict is not None and r.panel_passed is not None and r.self_verdict.passed != r.panel_passed else ""
+        s = _s(r.self_verdict.passed) if r.self_verdict is not None else "-"
+        p = _s(r.panel_passed) if r.panel_quorum else "none"
+        split = r.panel_split if r.panel_quorum else f"{r.panel_split} no quorum"
+        disagree = (
+            r.self_verdict is not None and r.self_verdict.passed is not None and r.panel_quorum and r.self_verdict.passed != r.panel_passed
         )
-        lines.append(f"  {c.id:28} {c.category:22} S {s:4}  P {p:4} {r.panel_split:>4}{flag}")
+        flag = ("  <- DISAGREE" if disagree else "") + ("  [case changed since recording]" if r.case_id in changed else "")
+        lines.append(f"  {c.id:28} {c.category:22} S {s:4}  P {p:4} {split}{flag}")
     lines.append("")
 
     disagreements = [
-        r for r in run.results if r.self_verdict is not None and r.panel_passed is not None and r.self_verdict.passed != r.panel_passed
+        r
+        for r in run.results
+        if r.self_verdict is not None and r.self_verdict.passed is not None and r.panel_quorum and r.self_verdict.passed != r.panel_passed
     ]
     if disagreements:
-        lines.append("DISAGREEMENTS")
+        lines.append("DISAGREEMENTS  (read these; a disagreement is a case for a human, not a verdict)")
         for r in disagreements:
             c = by_id[r.case_id]
             lines.append(f"  {c.id}: {c.title}")
             lines.append(f"    answer: {r.answer.text[:300].replace(chr(10), ' ')}{'…' if len(r.answer.text) > 300 else ''}")
             assert r.self_verdict is not None
             lines.append(
-                f"    self ({r.self_verdict.judge}): {'pass' if r.self_verdict.passed else 'fail'}; " + "; ".join(r.self_verdict.reasons)
+                f"    self ({_judge_label(r.self_verdict.judge, r.self_verdict.reported_model)}): {_s(r.self_verdict.passed).lower()}; "
+                + "; ".join(r.self_verdict.reasons)
             )
             for v in r.panel_verdicts:
-                lines.append(
-                    f"    panel {v.judge}: {'pass' if v.passed else 'fail'}{'' if v.parse_ok else ' (did not return JSON)'}; "
-                    + "; ".join(v.reasons)
-                )
+                verdict = "abstained (no usable verdict)" if v.passed is None else _s(v.passed).lower()
+                lines.append(f"    panel {_judge_label(v.judge, v.reported_model)}: {verdict}; " + "; ".join(v.reasons))
         lines.append("")
 
-    unparsed = [(r.case_id, v.judge) for r in run.results for v in r.panel_verdicts if not v.parse_ok]
-    if unparsed:
-        lines.append("JUDGES THAT DID NOT RETURN JSON (counted as fail): " + ", ".join(f"{c}/{j}" for c, j in unparsed))
+    abstentions = [(r.case_id, v.judge) for r in run.results for v in r.panel_verdicts if not v.parse_ok]
+    self_abst = [r.case_id for r in run.results if r.self_verdict is not None and not r.self_verdict.parse_ok]
+    if abstentions or self_abst:
+        lines.append(
+            "JUDGE FORMAT FAILURES  (a judge that did not return a usable verdict; these are abstentions about the judge, not evidence about the target)"
+        )
+        for cid, j in abstentions:
+            lines.append(f"  {cid}: panel {j}")
+        for cid in self_abst:
+            lines.append(f"  {cid}: self-judge")
         lines.append("")
 
     tok_in = sum(r.answer.usage.input_tokens or 0 for r in run.results)
@@ -130,6 +180,6 @@ def render(run: Run, cases: list[Case]) -> str:
     )
     lines.append("")
     lines.append(
-        "Read this as: the panel is three other models voting; it is not ground truth either. A disagreement is a case for a human to read."
+        "The panel is other models voting; it is not ground truth. Judges from one model family share blind spots. A disagreement is a case for a human to read."
     )
     return "\n".join(lines)
