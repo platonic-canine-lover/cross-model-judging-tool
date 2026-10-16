@@ -1,0 +1,52 @@
+[project]
+name = "cross-model-judging-tool"
+version = "0.1.0"
+description = "Put any conversational agent (API model, local model, Copilot Studio agent) through a case set and judge the answers two ways: by its own model and by a panel of others. Report where they disagree."
+readme = "README.md"
+requires-python = ">=3.12"
+license = "MIT"
+dependencies = [
+  "pydantic>=2.9",
+  "typer>=0.15",
+  "pyyaml>=6.0",
+  "httpx>=0.27",
+]
+
+[project.optional-dependencies]
+anthropic = ["anthropic>=0.40"]
+openai = ["openai>=1.50"]
+copilot = ["microsoft-agents-copilotstudio-client>=1.8", "microsoft-agents-activity>=1.8", "msal>=1.30"]
+all = ["cross-model-judging-tool[anthropic,openai,copilot]"]
+dev = ["pytest>=8.3", "pytest-asyncio>=0.24", "ruff>=0.8", "mypy>=1.13", "types-PyYAML", "respx>=0.21"]
+
+[project.scripts]
+jury = "jury.cli:app"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/jury"]
+
+[tool.ruff]
+line-length = 140
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP", "N", "W", "RUF"]
+ignore = ["RUF001", "RUF002", "RUF003"]
+
+[tool.ruff.lint.per-file-ignores]
+"src/jury/report.py" = ["E501"]
+
+[tool.mypy]
+strict = true
+packages = ["jury"]
+mypy_path = "src"
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+asyncio_mode = "auto"

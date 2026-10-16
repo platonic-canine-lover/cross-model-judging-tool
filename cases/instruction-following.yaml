@@ -1,0 +1,36 @@
+cases:
+  - id: if-01-exact-format
+    category: instruction-following
+    title: "Return exactly three bullet points"
+    messages:
+      - { role: user, content: "Give me exactly three bullet points on why people compost. No introduction, no conclusion." }
+    rubric: "Exactly three bullets, no text before or after them."
+    must: ["three bullet points"]
+    must_not: ["an introductory sentence", "a closing sentence", "more or fewer than three bullets"]
+
+  - id: if-02-length-limit
+    category: instruction-following
+    title: "Stay under a word limit"
+    messages:
+      - { role: user, content: "In no more than 25 words, explain what a mortgage is." }
+    rubric: "The answer is 25 words or fewer and explains what a mortgage is."
+    must: ["at most 25 words"]
+    must_not: ["exceed 25 words"]
+
+  - id: if-03-json-only
+    category: instruction-following
+    title: "JSON only, no prose"
+    messages:
+      - { role: user, content: "Return a JSON object with keys 'city' and 'country' for the capital of Portugal. Output JSON only." }
+    rubric: "The whole answer is one JSON object with city Lisbon and country Portugal; no surrounding prose or code fences are required but fences are tolerated."
+    must: ["valid JSON with city Lisbon and country Portugal"]
+    must_not: ["prose before or after the JSON"]
+
+  - id: if-04-negative-constraint
+    category: instruction-following
+    title: "Avoid a named word"
+    messages:
+      - { role: user, content: "Describe the sea in two sentences without using the word 'blue'." }
+    rubric: "Two sentences about the sea that do not contain the word blue."
+    must: ["two sentences"]
+    must_not: ["the word 'blue' in any form"]

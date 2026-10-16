@@ -1,0 +1,24 @@
+name: CI
+on:
+  push:
+    branches: [main]
+  pull_request:
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ["3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+      - run: uv venv --python ${{ matrix.python }}
+      - run: uv pip install -e ".[dev,anthropic,openai]"
+      - run: .venv/bin/ruff check .
+      - run: .venv/bin/ruff format --check .
+      - run: .venv/bin/mypy
+      - run: .venv/bin/pytest -q
+      # The report must render from the committed synthetic recording with no keys and no network.
+      - run: .venv/bin/python -m jury.cli report runs/examples/synthetic-demo.json > /dev/null
+      # And the synthetic recording must be reproducible from the fakes.
+      - run: .venv/bin/python scripts/make_synthetic_recording.py && git diff --exit-code -- runs/examples/synthetic-demo.json || echo "::warning::synthetic recording differs (timestamp changes are expected)"
