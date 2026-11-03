@@ -108,3 +108,23 @@ Tests reproduce the case above (now +0.0 points, 2/2) and check that an
 answer without a panel quorum is left out of both sides.
 
 45 tests.
+
+## Fresh-clone check (3 November 2026)
+
+**Installs ignored the lockfile.** The README and CI used `uv pip install
+-e`, which resolves the newest releases rather than `uv.lock`: a fresh
+install got Anthropic SDK 2.4.0 instead of the locked 1.15.0. Fixed: the
+README and CI use `uv sync` (`--locked` in CI, so a stale lock fails the
+build), with every extra.
+
+**The Copilot Studio adapter failed `mypy` against client 1.9.** Microsoft
+renamed `start_conversation`'s argument; the adapter's protocol named it
+the old way. CI never installed the `copilot` extra, so it was never
+type-checked. Runtime was unaffected (the adapter passes arguments by
+position). Fixed: the protocol's parameters are positional-only, and CI now
+installs the extra. Checked against the locked client (1.8.0) and the
+newest (1.9.0).
+
+The README now activates the virtual environment, without which `jury` is
+not on the PATH, and the pytest-asyncio fixture loop scope is set
+explicitly ahead of a default change.

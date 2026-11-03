@@ -31,7 +31,7 @@ changed.
 3. **Install the optional extra** and set the environment:
 
 ```bash
-uv pip install -e ".[copilot]"
+uv sync --all-extras   # installs every optional extra, Copilot Studio included
 export COPILOTSTUDIOAGENT__ENVIRONMENTID=<environment id>
 export COPILOTSTUDIOAGENT__AGENTAPPID=<app client id>
 export COPILOTSTUDIOAGENT__TENANTID=<tenant id>

@@ -30,16 +30,24 @@ because the sample's `acquire_token` helper is not part of the package.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import AsyncIterator
-from typing import Any, Protocol
+from collections.abc import AsyncIterable
+from typing import Any, Protocol, cast
 
 from jury.adapters.base import env, register
 from jury.types import Message, Reply, Target, Usage
 
 
 class _CopilotClientLike(Protocol):
-    def start_conversation(self, emit_start_message: bool = ...) -> AsyncIterator[Any]: ...
-    def ask_question(self, question: str, conversation_id: str) -> AsyncIterator[Any]: ...
+    """The two CopilotClient methods the adapter uses.
+
+    Parameters are positional-only because Microsoft renamed them between
+    client releases (1.9 renamed emit_start_message to
+    emit_start_conversation_event); the adapter passes them by position, so
+    the names are not part of the contract.
+    """
+
+    def start_conversation(self, emit_start: bool = ..., /) -> AsyncIterable[Any]: ...
+    def ask_question(self, question: str, conversation_id: str, /) -> AsyncIterable[Any]: ...
 
 
 class CopilotStudioTarget:
@@ -53,7 +61,7 @@ class CopilotStudioTarget:
         try:
             from microsoft_agents.copilotstudio.client import ConnectionSettings, CopilotClient, PowerPlatformEnvironment
         except ImportError as e:  # pragma: no cover - exercised only without the extra installed
-            raise RuntimeError('copilot-studio: install the optional extra: uv pip install -e ".[copilot]"') from e
+            raise RuntimeError("copilot-studio: install the optional extra: uv sync --all-extras") from e
         import msal
 
         settings = ConnectionSettings(
@@ -75,7 +83,7 @@ class CopilotStudioTarget:
             result = app.acquire_token_by_device_flow(flow)
         if "access_token" not in result:
             raise RuntimeError(f"copilot-studio: sign-in failed: {result.get('error_description', result)}")
-        return CopilotClient(settings, result["access_token"])  # type: ignore[no-any-return]
+        return cast(_CopilotClientLike, CopilotClient(settings, result["access_token"]))
 
     async def ask(self, messages: list[Message]) -> Reply:
         self.ignored_system_prompts += sum(1 for m in messages if m.role == "system")

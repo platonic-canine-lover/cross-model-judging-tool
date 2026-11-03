@@ -38,7 +38,8 @@ case set; the number you get is yours.
 ## Generate a report
 
 ```bash
-uv venv && uv pip install -e ".[dev,anthropic,openai]"   # add ,copilot for Copilot Studio
+uv sync --all-extras          # exactly the versions in uv.lock, Copilot Studio client included
+source .venv/bin/activate     # puts `jury` on your PATH
 cp .env.example .env                                     # fill in the providers you use
 export $(grep -v '^#' .env | xargs)
 
