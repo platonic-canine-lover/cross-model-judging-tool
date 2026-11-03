@@ -128,3 +128,12 @@ newest (1.9.0).
 The README now activates the virtual environment, without which `jury` is
 not on the PATH, and the pytest-asyncio fixture loop scope is set
 explicitly ahead of a default change.
+
+## Monthly health check (3 November 2026)
+
+**certifi 2026.7.22 trusted a compromised CA** (PYSEC-2026-4320,
+GHSA-6q48-6c7w-9gw2). Its bundle still included the emSign ECC Root CA G3,
+whose intermediates had their keys compromised; an on-path attacker holding
+one could intercept the adapters' HTTPS traffic. certifi is a runtime
+dependency through httpx. Fixed: the lock pins certifi 2026.10.23;
+`pip-audit` is clean and the 45 tests pass.
