@@ -22,7 +22,9 @@ do rather than what they did.
 
 That gap is the number this tool produces. The report calls it
 **self-grade inflation relative to the panel**: the self-judged pass rate
-minus the panel-judged pass rate, in points. The name is deliberate. It is
+minus the panel-judged pass rate, in points, over the answers both of them
+graded (an unreadable verdict from either side is left out, never counted
+as a fail, and the report says how many). The name is deliberate. It is
 the difference between two opinions, the model's and three other models',
 and it is not a measure of the target's actual accuracy; a panel can be
 wrong, share a blind spot, or read an ambiguous rubric differently. What
@@ -83,12 +85,12 @@ jury report runs/examples/synthetic-demo.json
 ```
 OVERALL
   answers 14
-  self-judged pass rate                     100%  (14/14)
+  self-judged pass rate                     100%  (14/14, usable verdicts only)
   panel-judged pass rate                    71%  (10/14, majority of 3 judges, usable verdicts only)
-  self-grade inflation relative to panel    +28.6 points (self minus panel; a difference of opinion, not a measure of accuracy)
+  self-grade inflation relative to panel    +28.6 points (self 100% minus panel 71% on the 14 answers both graded; a difference of opinion, not a measure of accuracy)
   agreement                                 10/14; self yes / panel no: 4; self no / panel yes: 0
 
-BY CATEGORY                       self   panel   inflation
+BY CATEGORY  (paired answers)     self   panel   inflation
   honesty                           100%    67%   +33.3
   instruction-following             100%    75%   +25.0
   persona-override                  100%    60%   +40.0
@@ -205,7 +207,7 @@ scripts/make_synthetic_recording.py
 runs/examples/synthetic-demo.json
 docs/copilot-studio.md
 docs/review-log.md      what independent review found and what changed
-tests/                  43 tests: parsing (including "false" as a string), abstention, majority and quorum, judge identity, case fingerprints and rejudge refusal, failed calls and resume, repeats, judge agreement, prompt, cases, adapters with mocked network
+tests/                  45 tests: parsing (including "false" as a string), abstention, majority and quorum, judge identity, case fingerprints and rejudge refusal, failed calls and resume, repeats, judge agreement, prompt, cases, adapters with mocked network
 ```
 
 ## Licence

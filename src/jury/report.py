@@ -1,11 +1,12 @@
 """The report: self-judge vs panel, per category and per case, and where they disagree.
 
 Vocabulary, used consistently:
-  self-judged pass rate      share of cases the target's own model passed
-  panel-judged pass rate     share of cases the panel's majority passed, counted over cases WITH a quorum
-  self-grade inflation       self-judged minus panel-judged, in points. It is a difference between two
-  relative to the panel      opinions. It is not a measure of the target's actual accuracy, because the
-                             panel is three other models, not ground truth.
+  self-judged pass rate      share of answers the target's own model passed, over its USABLE verdicts
+  panel-judged pass rate     share of answers the panel's majority passed, over answers WITH a quorum
+  self-grade inflation       self-judged minus panel-judged, in points, computed on the PAIRED answers:
+  relative to the panel      those with both a usable self verdict and a panel quorum, so the two rates
+                             are over the same answers. It is a difference between two opinions, not a
+                             measure of the target's actual accuracy; the panel is not ground truth.
   abstained                  a judge returned no usable verdict (format failure); not a vote
   no quorum                  fewer than a majority of the configured judges returned usable verdicts;
                              the case has no panel verdict and is excluded from the panel pass rate
@@ -22,36 +23,63 @@ from jury.types import Case, CaseResult, Run
 
 @dataclass
 class Rates:
-    n: int
-    n_with_quorum: int
-    self_pass: int
-    panel_pass: int
-    agree: int
-    self_yes_panel_no: int
-    self_no_panel_yes: int
+    """Counts behind every rate in the report. Unusable verdicts are never counted as fails."""
+
+    n: int = 0
+    n_with_quorum: int = 0
+    n_self_usable: int = 0
+    self_pass: int = 0
+    panel_pass: int = 0
+    # paired: a usable self verdict AND a panel quorum on the same answer
+    n_paired: int = 0
+    self_pass_paired: int = 0
+    panel_pass_paired: int = 0
+    agree: int = 0
+    self_yes_panel_no: int = 0
+    self_no_panel_yes: int = 0
+
+    @property
+    def self_unusable(self) -> int:
+        return self.n - self.n_self_usable
 
     @property
     def self_rate(self) -> float:
-        return self.self_pass / self.n if self.n else 0.0
+        return self.self_pass / self.n_self_usable if self.n_self_usable else 0.0
 
     @property
     def panel_rate(self) -> float:
         return self.panel_pass / self.n_with_quorum if self.n_with_quorum else 0.0
 
+    @property
+    def self_rate_paired(self) -> float:
+        return self.self_pass_paired / self.n_paired if self.n_paired else 0.0
+
+    @property
+    def panel_rate_paired(self) -> float:
+        return self.panel_pass_paired / self.n_paired if self.n_paired else 0.0
+
+    @property
+    def inflation(self) -> float:
+        """Self minus panel on the paired answers, so both rates are over the same answers."""
+        return inflation(self.self_rate_paired, self.panel_rate_paired)
+
 
 def rates(run: Run, case_ids: list[str] | None = None) -> Rates:
     rs = [r for r in run.results if case_ids is None or r.case_id in case_ids]
-    r = Rates(n=len(rs), n_with_quorum=0, self_pass=0, panel_pass=0, agree=0, self_yes_panel_no=0, self_no_panel_yes=0)
+    r = Rates(n=len(rs))
     for x in rs:
         s = x.self_verdict.passed if x.self_verdict else None
         p = x.panel_passed if x.panel_quorum else None
-        if x.panel_quorum:
+        if p is not None:
             r.n_with_quorum += 1
-        if s:
-            r.self_pass += 1
-        if p:
-            r.panel_pass += 1
+            r.panel_pass += p
+        if s is not None:
+            r.n_self_usable += 1
+            r.self_pass += s
         if s is not None and p is not None:
+            r.n_paired += 1
+            r.self_pass_paired += s
+            r.panel_pass_paired += p
             if s == p:
                 r.agree += 1
             elif s and not p:
@@ -116,16 +144,19 @@ def render(run: Run, cases: list[Case], changed_cases: list[str] | None = None) 
         + (f" ({no_quorum} without a panel quorum, excluded from the panel rate)" if no_quorum else "")
     )
     if run.self_judge:
-        lines.append(f"  self-judged pass rate                     {pct(overall.self_rate)}  ({overall.self_pass}/{overall.n})")
+        unusable = f", {overall.self_unusable} unusable self verdict(s) excluded" if overall.self_unusable else ""
+        lines.append(
+            f"  self-judged pass rate                     {pct(overall.self_rate)}  ({overall.self_pass}/{overall.n_self_usable}, usable verdicts only{unusable})"
+        )
     lines.append(
         f"  panel-judged pass rate                    {pct(overall.panel_rate)}  ({overall.panel_pass}/{overall.n_with_quorum}, majority of {len(run.judges)} judges, usable verdicts only)"
     )
     if run.self_judge:
         lines.append(
-            f"  self-grade inflation relative to panel    {inflation(overall.self_rate, overall.panel_rate):+.1f} points (self minus panel; a difference of opinion, not a measure of accuracy)"
+            f"  self-grade inflation relative to panel    {overall.inflation:+.1f} points (self {pct(overall.self_rate_paired)} minus panel {pct(overall.panel_rate_paired)} on the {overall.n_paired} answers both graded; a difference of opinion, not a measure of accuracy)"
         )
         lines.append(
-            f"  agreement                                 {overall.agree}/{overall.n_with_quorum}; self yes / panel no: {overall.self_yes_panel_no}; self no / panel yes: {overall.self_no_panel_yes}"
+            f"  agreement                                 {overall.agree}/{overall.n_paired}; self yes / panel no: {overall.self_yes_panel_no}; self no / panel yes: {overall.self_no_panel_yes}"
         )
     lines.append("")
 
@@ -141,11 +172,11 @@ def render(run: Run, cases: list[Case], changed_cases: list[str] | None = None) 
     cats: dict[str, list[str]] = defaultdict(list)
     for r in run.results:
         cats[by_id[r.case_id].category].append(r.case_id)
-    lines.append("BY CATEGORY" + ("                       self   panel   inflation" if run.self_judge else "                       panel"))
+    lines.append("BY CATEGORY" + ("  (paired answers)     self   panel   inflation" if run.self_judge else "                       panel"))
     for cat, ids in sorted(cats.items()):
         rt = rates(run, ids)
         if run.self_judge:
-            lines.append(f"  {cat:32} {pct(rt.self_rate):>5}  {pct(rt.panel_rate):>5}   {inflation(rt.self_rate, rt.panel_rate):+.1f}")
+            lines.append(f"  {cat:32} {pct(rt.self_rate_paired):>5}  {pct(rt.panel_rate_paired):>5}   {rt.inflation:+.1f}")
         else:
             lines.append(f"  {cat:32} {pct(rt.panel_rate):>5}")
     lines.append("")

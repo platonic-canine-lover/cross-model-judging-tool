@@ -377,3 +377,49 @@ async def test_target_on_the_panel_is_flagged(scripted):
     run = await run_cases(scripted, [me, RuleJudge("fake:j", lambda a: True)], cases, CASES, None)
     assert run.panel_includes_target
     assert "WARNING: the panel includes the target" in render(run, cases)
+
+
+class TestSelfRateIsNotSkewedByUnusableVerdicts:
+    async def test_unusable_self_verdicts_are_excluded_not_counted_as_fails(self, scripted):
+        # Self agrees with the panel on every answer it graded usably, but half its verdicts are unreadable.
+        # Before: self 50% (2/4) vs panel 100%, "inflation -50 points", agreement 2/4. That was an artefact.
+        cases = load_cases(CASES)[:4]
+        panel = [RuleJudge("fake:j1", lambda a: True), RuleJudge("fake:j2", lambda a: True)]
+        run = await run_cases(scripted, panel, cases, CASES, None)
+        for i in (1, 3):  # make two self verdicts unusable
+            run.results[i].self_verdict = abstain("fake:target")
+        for i in (0, 2):
+            run.results[i].self_verdict = v("fake:target", True)
+        run.self_judge = True
+        r = rates(run)
+        assert (r.n_self_usable, r.self_unusable, r.self_rate) == (2, 2, 1.0)
+        assert (r.n_paired, r.agree, r.inflation) == (2, 2, 0.0)
+        text = render(run, cases)
+        assert "(2/2, usable verdicts only, 2 unusable self verdict(s) excluded)" in text
+        assert "+0.0 points (self 100% minus panel 100% on the 2 answers both graded" in text
+        assert "agreement                                 2/2" in text
+
+    def test_inflation_compares_the_same_answers(self):
+        # Self passes everything; the panel fails one answer and has no quorum on another.
+        # Unpaired rates would be self 3/3 vs panel 1/2; paired is self 2/2 vs panel 1/2 = +50.
+        from jury.types import Run
+
+        def result(case_id, self_pass, panel):
+            from jury.types import CaseResult, Reply
+
+            verdicts = [] if panel is None else [v("fake:j", panel)]
+            return CaseResult(
+                case_id=case_id,
+                target="t",
+                answer=Reply(text="", model="t"),
+                self_verdict=v("t", self_pass),
+                panel_verdicts=verdicts,
+                panel_passed=panel,
+                panel_quorum=panel is not None,
+            )
+
+        run = Run(run_id="x", target="t", judges=["fake:j"], self_judge=True, cases_dir="cases")
+        run.results = [result("a", True, True), result("b", True, False), result("c", True, None)]
+        r = rates(run)
+        assert r.self_rate == 1.0 and r.n_paired == 2
+        assert (r.self_rate_paired, r.panel_rate_paired, r.inflation) == (1.0, 0.5, 50.0)

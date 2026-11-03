@@ -91,3 +91,20 @@ does; the reviewer's model list was out of date. The README now says the
 ids in the example are examples and to use whatever the account lists.
 
 43 tests.
+
+## Review 3: independent code scan (commit `656b301` reviewed)
+
+**The self-judged rate counted the self-judge's unusable verdicts as
+fails, while the panel rate excluded the panel's.** The two rates were
+over different answers, so the headline inflation figure could move for
+reasons that had nothing to do with self-grading. A self-judge that agreed
+with the panel on every answer it graded, but returned unreadable output
+on half of them, was reported as "self 50%, panel 100%, inflation -50
+points, agreement 2/4". Fixed: the self rate is over usable self verdicts,
+with the excluded count printed; inflation, the category table and
+agreement are computed on the PAIRED answers (a usable self verdict and a
+panel quorum on the same answer), and the report says how many that is.
+Tests reproduce the case above (now +0.0 points, 2/2) and check that an
+answer without a panel quorum is left out of both sides.
+
+45 tests.
